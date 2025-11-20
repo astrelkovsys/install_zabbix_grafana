@@ -62,3 +62,6 @@ sudo systemctl enable grafana-server
 
 # Очистка загруженных пакетов
 rm zabbix-release_7.
+
+echo "Установка завершена! Пожалуйста, настройте Zabbix через веб-интерфейс и Grafana."
+
