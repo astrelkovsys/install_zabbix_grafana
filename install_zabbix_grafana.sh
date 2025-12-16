@@ -8,111 +8,113 @@ sudo apt update
 sudo apt install -y wget gnupg2 software-properties-common apt-transport-https
 
 # -------------------------------------------------
-# 2. Добавление репозитория Zabbix
+# 2. Установка MySQL (MariaDB) – будет использоваться Grafana
 # -------------------------------------------------
-ZABBIX_VER="6.4"
-DEB_URL="https://repo.zabbix.com/zabbix/${ZABBIX_VER}/ubuntu/pool/main/z/zabbix-release/zabbix-release_${ZABBIX_VER}-1+ubuntu24.04_all.deb"
-TMP_DEB="/tmp/zabbix-release_${ZABBIX_VER}.deb"
+sudo apt install -y mariadb-server
 
-wget -qO "$TMP_DEB" "$DEB_URL"
-sudo dpkg -i "$TMP_DEB"
-sudo apt update
-
-# -------------------------------------------------
-# 3. Установка пакетов Zabbix и PostgreSQL
-# -------------------------------------------------
-sudo apt install -y zabbix-server-pgsql zabbix-frontend-php zabbix-apache-conf \
-                    zabbix-agent postgresql
-
-# -------------------------------------------------
-# 4. Создание базы и роли (если их ещё нет)
-# -------------------------------------------------
-DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='zabbix';")
-ROLE_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='zabbix';")
-
-if [[ "$DB_EXISTS" != "1" ]]; then
-    sudo -u postgres psql <<SQL
-CREATE DATABASE zabbix;
+# Защищённая инициализация (корневой пароль пустой, но доступ только локально)
+sudo mysql <<SQL
+DELETE FROM mysql.user WHERE User='';
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
 SQL
-fi
 
-if [[ "$ROLE_EXISTS" != "1" ]]; then
-    sudo -u postgres psql <<SQL
-CREATE USER zabbix WITH ENCRYPTED PASSWORD 'zabbix_pass';
+# Создаём базу и пользователя для Grafana
+DB_NAME="grafana"
+DB_USER="grafana"
+DB_PASS="grafana_pass"
+
+sudo mysql <<SQL
+CREATE DATABASE ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
+FLUSH PRIVILEGES;
 SQL
-fi
-
-# Даем права роли на базу (выполняем независимо от того, была она создана или нет)
-sudo -u postgres psql -d zabbix -c "GRANT ALL PRIVILEGES ON DATABASE zabbix TO zabbix;"
 
 # -------------------------------------------------
-# 5. Инициализация схемы Zabbix
+# 3. Установка Prometheus
 # -------------------------------------------------
-# Пытаемся найти уже установленный файл
-SQL_GZ=$(dpkg -L zabbix-server-pgsql | grep '/create\.sql\.gz$' || true)
+PROM_VER="2.53.0"
+PROM_URL="https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz"
+TMP_DIR="/tmp/prometheus_install"
 
-if [[ -z "$SQL_GZ" ]]; then
-    echo "Файл create.sql.gz не найден в пакете – скачиваем его вручную."
-    # URL официального скрипта с схемой (из репозитория Zabbix)
-    SCHEMA_URL="https://repo.zabbix.com/zabbix/${ZABBIX_VER}/source/zabbix-${ZABBIX_VER}.tar.gz"
-    TMP_TAR="/tmp/zabbix-${ZABBIX_VER}.tar.gz"
-    wget -qO "$TMP_TAR" "$SCHEMA_URL"
-    mkdir -p /tmp/zabbix_src
-    tar -xzf "$TMP_TAR" -C /tmp/zabbix_src --strip-components=1 \
-        "database/postgresql/create.sql"
-    SQL_FILE="/tmp/zabbix_src/create.sql"
-else
-    SQL_FILE="/tmp/create.sql"
-    zcat "$SQL_GZ" > "$SQL_FILE"
-fi
+mkdir -p "$TMP_DIR"
+wget -qO- "$PROM_URL" | tar -xz -C "$TMP_DIR" --strip-components=1
 
-# Загружаем схему в базу
-sudo -u zabbix psql -d zabbix -f "$SQL_FILE"
+sudo mv "$TMP_DIR" /opt/prometheus
+sudo useradd --no-create-home --shell /usr/sbin/nologin prometheus
+sudo mkdir -p /etc/prometheus /var/lib/prometheus
+sudo cp /opt/prometheus/prometheus.yml /etc/prometheus/
+sudo cp -r /opt/prometheus/consoles /opt/prometheus/console_libraries /etc/prometheus/
+sudo chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus /opt/prometheus
+
+# Systemd‑служба Prometheus
+cat <<'EOF' | sudo tee /etc/systemd/system/prometheus.service > /dev/null
+[Unit]
+Description=Prometheus Monitoring
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/opt/prometheus/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --web.console.templates=/etc/prometheus/consoles \
+  --web.console.libraries=/etc/prometheus/console_libraries
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now prometheus
 
 # -------------------------------------------------
-# 6. Конфигурация сервера Zabbix
+# 4. Установка Grafana (с MySQL‑бэкендом)
 # -------------------------------------------------
-sudo sed -i "s/^# DBPassword=/DBPassword=zabbix_pass/" /etc/zabbix/zabbix_server.conf
-sudo sed -i "s/^DBHost=localhost/DBHost=localhost/" /etc/zabbix/zabbix_server.conf
-sudo sed -i "s/^DBName=\/var\/lib\/zabbix\/zabbix_server\.db/DBName=zabbix/" /etc/zabbix/zabbix_server.conf
-sudo sed -i "s/^DBUser=zabbix/DBUser=zabbix/" /etc/zabbix/zabbix_server.conf
-
-# -------------------------------------------------
-# 7. Запуск и включение сервисов Zabbix
-# -------------------------------------------------
-sudo systemctl restart postgresql
-sudo systemctl enable --now zabbix-server zabbix-agent apache2
-
-# -------------------------------------------------
-# 8. Установка Grafana
-# -------------------------------------------------
+# Добавляем репозиторий Grafana
 wget -qO- https://apt.grafana.com/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/grafana.gpg
 echo "deb [signed-by=/usr/share/keyrings/grafana.gpg] https://apt.grafana.com stable main" | \
     sudo tee /etc/apt/sources.list.d/grafana.list > /dev/null
 
 sudo apt update
 sudo apt install -y grafana
+
+# Включаем MySQL‑датасорс в Grafana (конфиг в /etc/grafana/grafana.ini)
+sudo sed -i "s/;type = mysql/type = mysql/" /etc/grafana/grafana.ini
+sudo sed -i "s/;host = .*/host = 127.0.0.1:3306/" /etc/grafana/grafana.ini
+sudo sed -i "s/;name = .*/name = ${DB_NAME}/" /etc/grafana/grafana.ini
+sudo sed -i "s/;user = .*/user = ${DB_USER}/" /etc/grafana/grafana.ini
+sudo sed -i "s/;password = .*/password = ${DB_PASS}/" /etc/grafana/grafana.ini
+
 sudo systemctl enable --now grafana-server
 
 # -------------------------------------------------
-# 9. Открытие портов (ufw, если установлен)
+# 5. Открытие портов (ufw, если установлен)
 # -------------------------------------------------
 if command -v ufw >/dev/null; then
-    sudo ufw allow 10050/tcp   # Zabbix агент
-    sudo ufw allow 10051/tcp   # Zabbix сервер
-    sudo ufw allow 3000/tcp    # Grafana
-    sudo ufw allow 80/tcp      # HTTP (Zabbix UI)
-    sudo ufw allow 443/tcp     # HTTPS (по желанию)
+    sudo ufw allow 9090/tcp   # Prometheus
+    sudo ufw allow 3000/tcp   # Grafana
+    sudo ufw allow 3306/tcp   # MySQL (локальный доступ уже открыт)
 fi
 
 # -------------------------------------------------
-# 10. Информационное сообщение
+# 6. Информационное сообщение
 # -------------------------------------------------
 cat <<EOF
 === Установка завершена ===
 
-Zabbix UI: http://<your_ip>/zabbix   (логин: Admin, пароль: zabbix)
-Grafana:   http://<your_ip>:3000    (логин: admin, пароль: admin)
+Prometheus: http://<your_ip>:9090
+Grafana:   http://<your_ip>:3000   (admin / admin)
 
-Поменяйте пароли при первом входе.
+Grafana использует MySQL‑базу:
+  DB   = ${DB_NAME}
+  User = ${DB_USER}
+  Pass = ${DB_PASS}
+
+Не забудьте сменить пароль admin в Grafana после первого входа.
 EOF
