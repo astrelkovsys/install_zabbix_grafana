@@ -18,7 +18,7 @@ TMP_DEB="/tmp/zabbix-release_${ZABBIX_VER}.deb"
 wget -qO "$TMP_DEB" "$DEB_URL"
 sudo dpkg -i "$TMP_DEB"
 
-# Обновляем индексы пакетов
+# Обновляем индексы пакетов после добавления репозитория
 sudo apt update
 
 # Устанавливаем сервер, веб‑интерфейс (Apache) и агент
@@ -40,7 +40,7 @@ SQL
 zcat /usr/share/doc/zabbix-server-pgsql/create.sql.gz | \
     sudo -u zabbix psql -d zabbix
 
-# Конфиг сервера
+# Конфигурация сервера Zabbix
 sudo sed -i "s/^# DBPassword=/DBPassword=zabbix_pass/" /etc/zabbix/zabbix_server.conf
 sudo sed -i "s/^DBHost=localhost/DBHost=localhost/" /etc/zabbix/zabbix_server.conf
 sudo sed -i "s/^DBName=\/var\/lib\/zabbix\/zabbix_server\.db/DBName=zabbix/" /etc/zabbix/zabbix_server.conf
