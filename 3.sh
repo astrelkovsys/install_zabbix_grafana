@@ -4,7 +4,7 @@ set -euo pipefail
 # ------------------------------
 # 0. Variables
 # ------------------------------
-PROM_VERSION="3.5.0"
+PROM_VERSION="2.53.0"
 PROM_URL="https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
 TMP_DIR="/tmp/prometheus-setup"
 IP=$(hostname -I | awk '{print $1}')
