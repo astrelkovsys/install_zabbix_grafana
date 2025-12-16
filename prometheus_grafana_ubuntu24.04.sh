@@ -16,16 +16,11 @@ GRAFANA_KEYRING="/usr/share/keyrings/grafana-archive-keyring.gpg"
 GRAFANA_PROV_DIR="/etc/grafana/provisioning"
 GRAFANA_USERS_PROV_DIR="${GRAFANA_PROV_DIR}/users"
 GRAFANA_ADMIN_USER="admin"
-GRAFANA_ADMIN_PASSWORD="ChangeMeNow123!"   # <- поменяйте на желаемый безопасный пароль
+GRAFANA_ADMIN_PASSWORD="ChangeMeNow123!"   # <- замените на безопасный пароль
 
-# Check required commands
-for cmd in wget tar systemctl apt-get jq; do
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    sudo apt-get update -y
-    sudo apt-get install -y wget tar gnupg ca-certificates jq
-    break
-  fi
-done
+# Ensure required packages
+sudo apt-get update -y
+sudo apt-get install -y wget tar gnupg curl ca-certificates jq
 
 # Create prometheus user if needed
 if ! id -u "${PROM_USER}" >/dev/null 2>&1; then
@@ -103,15 +98,35 @@ EOT
 sudo systemctl daemon-reload
 sudo systemctl enable --now prometheus
 
-# Install Grafana OSS (keyring method)
-wget -qO- https://packages.grafana.com/gpg.key | sudo tee "${GRAFANA_KEYRING}" >/dev/null
+# Install Grafana OSS (keyring method) with correct key handling
+sudo mkdir -p /usr/share/keyrings
+# remove old entries if any
+sudo rm -f /etc/apt/sources.list.d/grafana.list "${GRAFANA_KEYRING}" || true
+
+# download key and dearmor
+if ! curl -fsSL https://packages.grafana.com/gpg.key | sudo gpg --dearmor -o "${GRAFANA_KEYRING}"; then
+  echo "Failed to fetch or dearmor Grafana GPG key" >&2
+  exit 1
+fi
+
+# add repository with signed-by
 echo "deb [signed-by=${GRAFANA_KEYRING}] https://packages.grafana.com/oss/deb stable main" | sudo tee /etc/apt/sources.list.d/grafana.list
+
+# update and install grafana
 sudo apt-get update -y
+# check for apt update errors related to grafana key
+if ! sudo apt-get update -y 2>&1 | tee /tmp/apt-update.log | grep -q "Reading package lists"; then
+  echo "apt-get update failed; see /tmp/apt-update.log" >&2
+  tail -n 200 /tmp/apt-update.log
+  exit 1
+fi
+
 sudo apt-get install -y grafana
 
-# Create provisioning to set admin password
+# Create provisioning to set admin password via grafana-cli oneshot
 sudo mkdir -p "${GRAFANA_USERS_PROV_DIR}"
-# users.yaml (provisioning file)
+
+# users.yaml (placeholder; external_user_mgr true avoids changing local users via provisioning)
 sudo tee "${GRAFANA_USERS_PROV_DIR}/users.yaml" > /dev/null <<EOT
 apiVersion: 1
 
@@ -121,8 +136,7 @@ providers:
     external_user_mgr: true
 EOT
 
-# Use Grafana CLI to set admin password on first run via a small systemd oneshot service
-# Create a oneshot service that runs after grafana starts and changes admin password using grafana-cli admin reset-admin-password
+# oneshot service to reset admin password
 sudo tee /etc/systemd/system/grafana-change-admin-password.service > /dev/null <<EOT
 [Unit]
 Description=Set Grafana admin password once
@@ -131,7 +145,7 @@ Requires=grafana-server.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'sleep 5; /usr/sbin/grafana-cli admin reset-admin-password ${GRAFANA_ADMIN_PASSWORD} || true'
+ExecStart=/bin/bash -c 'sleep 5; if command -v grafana-cli >/dev/null 2>&1; then grafana-cli admin reset-admin-password ${GRAFANA_ADMIN_PASSWORD} || true; else echo "grafana-cli not found"; fi'
 RemainAfterExit=yes
 
 [Install]
@@ -140,7 +154,6 @@ EOT
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now grafana-server
-# enable and run the oneshot to change password
 sudo systemctl enable --now grafana-change-admin-password.service || true
 
 # Verify services
